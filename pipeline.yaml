@@ -1,0 +1,1337 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "CICD Pipeline for Core Infrastructure Deployment"
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: 
+          default: Account Configuration
+        Parameters:
+        - pDevelopmentAccountId
+        - pTestAccountId
+        - pProductionAccountId
+      - Label:
+          default: Deployment Configuration
+        Parameters:
+        - pCoreDeploymentFile
+        - pDevelopmentParameters
+        - pTestParameters
+        - pProductionParameters
+        - pEcrRepoUri
+        - pS3BucketLambdaResources
+      - Label:
+          default: Deployment Approvals
+        Parameters:
+        - pTestApprovalEmailAddress
+        - pProductionApprovalEmailAddress
+      - Label: 
+          default: Permissions Configuration
+        Parameters:
+        - pKmsAdministratorRoleArn    
+      - Label:
+          default: Tagging Configuration
+        Parameters:
+        - pEnvironmentName
+        - pWorkloadName
+Parameters:
+  pDevelopmentAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be used as the Development Account."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+  pTestAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be used as the Test Account."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+  pProductionAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be used as the Production Account."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+  pKmsAdministratorRoleArn:
+    Type: String
+    Description: "The ARN of the Role within the Tooling Account that you wish to Administer the KMS Key used for the Pipeline"
+  pCoreDeploymentFile:
+    Type: String
+    Description: "Name of the CloudFormation Deployment File"
+    Default: "infrastructure.yaml"
+  pDevelopmentParameters:
+    Type: String
+    Description: "Name of the Development Parameters File"
+    Default: "development.json"
+  pTestParameters:
+    Type: String
+    Description: "Name of the Test Parameters File"
+    Default: "test.json"
+  pProductionParameters:
+    Type: String
+    Description: "Name of the Production Parameters File"  
+    Default: "production.json"
+  pTestApprovalEmailAddress:
+    Type: String
+    Description: "E-Mail Address for Approvals for Test Deployment"
+  pProductionApprovalEmailAddress:
+    Type: String
+    Description: "E-Mail Address for Approvals for Production Deployment"
+  pS3BucketLambdaResources:
+    Type: String
+    Description: "The S3 Bucket where Lambda Deployment Files are located"
+  pEcrRepoUri:
+    Type: String
+    Description: "The URI of the ECR Repository" 
+  pEnvironmentName:
+    Type: String
+    Description: "Select the Name of the Environment"
+    AllowedValues:
+      - Production
+      - Test
+      - Development
+  pWorkloadName:
+    Type: String
+    Description: "Name of the Workload"    
+Resources:
+  # S3 Bucket & Bucket Policy
+  rS3PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Sub "codepipeline-${AWS::Region}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName          
+  rS3PipelineArtifactBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref rS3PipelineArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Deny"
+            Principal: "*"
+            Action: 
+              - "s3:PutObject"
+            Resource:
+              - !Sub "arn:aws:s3:::${rS3PipelineArtifactBucket}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: "aws:kms"              
+          - Action: "s3:*"
+            Effect: "Deny"
+            Principal: "*"
+            Resource:
+              - !Sub "arn:aws:s3:::${rS3PipelineArtifactBucket}"
+              - !Sub "arn:aws:s3:::${rS3PipelineArtifactBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Effect: "Allow"
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${pDevelopmentAccountId}:root"
+                - !Sub "arn:aws:iam::${pTestAccountId}:root"
+                - !Sub "arn:aws:iam::${pProductionAccountId}:root"
+              Service:
+                - "codedeploy.amazonaws.com"
+            Action: 
+              - "s3:Get*"
+              - "s3:Put*"
+            Resource: 
+              - !Sub "arn:aws:s3:::${rS3PipelineArtifactBucket}/*"
+          - Effect: "Allow"
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${pDevelopmentAccountId}:root"
+                - !Sub "arn:aws:iam::${pTestAccountId}:root"
+                - !Sub "arn:aws:iam::${pProductionAccountId}:root"
+              Service:
+                - "codedeploy.amazonaws.com"
+            Action: 
+              - "s3:ListBucket"
+            Resource: 
+              - !Sub "arn:aws:s3:::${rS3PipelineArtifactBucket}"
+  
+  # KMS Key & Alias
+  rKmsKeyPipeline:
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: "KMS Key used for CICD Infrastructure Pipeline"
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - "kms:*"
+            Resource: 
+              - "*"
+          - Sid: "Allow access for Key Administrators"
+            Effect: "Allow"
+            Principal:
+              AWS: !Ref pKmsAdministratorRoleArn
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: 
+              - "*"
+          - Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${pDevelopmentAccountId}:root"
+                - !Sub "arn:aws:iam::${pTestAccountId}:root"
+                - !Sub "arn:aws:iam::${pProductionAccountId}:root"
+                - !GetAtt rIamRolePipeline.Arn
+                # - !GetAtt rIamRoleBuildProject.Arn
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey"
+              - "kms:DescribeKey"
+            Resource: 
+              - "*"
+      PendingWindowInDays: 7
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+  rKmsKeyPipelineAlias:
+    Type: AWS::KMS::Alias
+    Properties: 
+      AliasName: "alias/Pipelines"
+      TargetKeyId: !GetAtt rKmsKeyPipeline.Arn
+  
+  # IAM Roles & Policies
+  rIamRolePipeline:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "codepipeline.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Ref rIamPolicyPipeline
+      RoleName: !Sub "${pWorkloadName}-Pipeline-Service-Role"
+  rIamPolicyPipeline:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${pWorkloadName}-Pipeline-Service-Policy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Resource: 
+              - !Sub "arn:aws:iam::${pDevelopmentAccountId}:role/*"
+              - !Sub "arn:aws:iam::${pTestAccountId}:role/*"
+              - !Sub "arn:aws:iam::${pProductionAccountId}:role/*"
+          - Effect: "Allow"
+            Action:
+              - "iam:PassRole"
+            Resource: 
+              - "*"
+            Condition:
+              StringEqualsIfExists:
+                iam:PassedToService:
+                - "cloudformation.amazonaws.com"
+                - "elasticbeanstalk.amazonaws.com"
+                - "ec2.amazonaws.com"
+                - "ecs-task.amazonaws.com"
+          - Effect: "Allow"
+            Action:
+              - "codecommit:CancelUploadArchive"
+              - "codecommit:GetBranch"
+              - "codecommit:GetCommit"
+              - "codecommit:GetRepository"
+              - "codecommit:GetUploadArchiveStatus"
+              - "codecommit:UploadArchive"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "codedeploy:CreateDeployment"
+              - "codedeploy:GetApplication"
+              - "codedeploy:GetApplicationRevision"
+              - "codedeploy:GetDeployment"
+              - "codedeploy:GetDeploymentConfig"
+              - "codedeploy:RegisterApplicationRevision"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "codestar-connections:UseConnection"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "elasticbeanstalk:*"
+              - "ec2:*"
+              - "elasticloadbalancing:*"
+              - "autoscaling:*"
+              - "cloudwatch:*"
+              - "s3:*"
+              - "sns:*"
+              - "cloudformation:*"
+              - "rds:*"
+              - "sqs:*"
+              - "ecs:*"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "lambda:InvokeFunction"
+              - "lambda:ListFunctions"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "opsworks:CreateDeployment"
+              - "opsworks:DescribeApps"
+              - "opsworks:DescribeCommands"
+              - "opsworks:DescribeDeployments"
+              - "opsworks:DescribeInstances"
+              - "opsworks:DescribeStacks"
+              - "opsworks:UpdateApp"
+              - "opsworks:UpdateStack"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "cloudformation:CreateStack"
+              - "cloudformation:DeleteStack"
+              - "cloudformation:DescribeStacks"
+              - "cloudformation:UpdateStack"
+              - "cloudformation:CreateChangeSet"
+              - "cloudformation:DeleteChangeSet"
+              - "cloudformation:DescribeChangeSet"
+              - "cloudformation:ExecuteChangeSet"
+              - "cloudformation:SetStackPolicy"
+              - "cloudformation:ValidateTemplate"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "codebuild:BatchGetBuildBatches"
+              - "codebuild:StartBuild"
+              - "codebuild:BatchGetBuilds"
+              - "codebuild:StartBuildBatch"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "devicefarm:ListProjects"
+              - "devicefarm:ListDevicePools"
+              - "devicefarm:GetRun"
+              - "devicefarm:GetUpload"
+              - "devicefarm:CreateUpload"
+              - "devicefarm:ScheduleRun"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "servicecatalog:ListProvisioningArtifacts"
+              - "servicecatalog:CreateProvisioningArtifact"
+              - "servicecatalog:DescribeProvisioningArtifact"
+              - "servicecatalog:DeleteProvisioningArtifact"
+              - "servicecatalog:UpdateProduct"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "cloudformation:ValidateTemplate"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "ecr:DescribeImages"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "states:DescribeExecution"
+              - "states:DescribeStateMachine"
+              - "states:StartExecution"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "appconfig:StartDeployment"
+              - "appconfig:StopDeployment"
+              - "appconfig:GetDeployment"
+            Resource: 
+              - "*"
+  rIamRoleBuildProject:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "codebuild.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Ref rIamPolicyBuildProject
+        - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess"
+      RoleName: !Sub "${pWorkloadName}-CodeBuild-Service-Role"
+  rIamPolicyBuildProject:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${pWorkloadName}-CodeBuild-Service-Policy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: 
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+              - "s3:GetBucketAcl"
+              - "s3:GetBucketLocation"
+            Resource: 
+              - !Sub "arn:aws:s3:::${rS3PipelineArtifactBucket}/*"
+              - !Sub "arn:aws:s3:::${pS3BucketLambdaResources}/*"
+          - Effect: "Allow"
+            Action:
+              - "codecommit:GitPull"
+            Resource: 
+              - !GetAtt rCodeCommitInfra.Arn
+          - Effect: "Allow"
+            Action:
+              - "codebuild:CreateReportGroup"
+              - "codebuild:CreateReport"
+              - "codebuild:UpdateReport"
+              - "codebuild:BatchPutTestCases"
+              - "codebuild:BatchPutCodeCoverages"
+            Resource:
+              - "arn:aws:codebuild:eu-west-2:468608257232:report-group/*"
+          - Effect: "Allow"
+            Action:
+              - "kms:DescribeKey"
+              - "kms:GenerateDataKey"
+              - "kms:Encrypt"
+              - "kms:ReEncrypt*"
+              - "kms:Decrypt"
+            Resource:
+              - !GetAtt rKmsKeyPipeline.Arn
+          - Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Resource:
+              - !Sub "arn:aws:iam::${pDevelopmentAccountId}:role/*"
+              - !Sub "arn:aws:iam::${pTestAccountId}:role/*"
+              - !Sub "arn:aws:iam::${pProductionAccountId}:role/*"              
+  rIamRoleEventBridgeTriggerPipeline:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service:
+                  - "events.amazonaws.com"
+              Action:
+                  - "sts:AssumeRole"
+        Path: "/"
+        ManagedPolicyArns:
+            - !Ref rIamPolicyEventBridgeTriggerPipeline
+        RoleName: !Sub "${pWorkloadName}-EventBridge-Service-Role"
+  rIamPolicyEventBridgeTriggerPipeline:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${pWorkloadName}-EventBridge-Service-Policy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "codepipeline:StartPipelineExecution"
+            Resource: 
+              - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipelineInfra}"
+              - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipelineEcsBuild}"
+              - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipelineEcsDeploy}"
+
+  # SNS Topics & Subscription
+  rSnsTopicTestDeploymentApproval:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: "Pipeline-Approval-for-Test-Environment-Deployment"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TopicName: "Pipeline-Approval-for-Test-Environment-Deployment"
+  rSnsTopicProductionDeploymentApproval:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: "Pipeline-Approval-for-Production-Environment-Deployment"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TopicName: "Pipeline-Approval-for-Production-Environment-Deployment"  
+  rSnsSubscriptionTestDeploymentApproval:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref pTestApprovalEmailAddress
+      Protocol: "email"
+      TopicArn: !Ref rSnsTopicTestDeploymentApproval
+  rSnsSubscriptionProductionDeploymentApproval:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref pProductionApprovalEmailAddress
+      Protocol: "email"
+      TopicArn: !Ref rSnsTopicProductionDeploymentApproval
+
+  # CodeCommit, CodeBuild and CodePipeline
+  rCodeCommitInfra:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryDescription: "Repository to be used for Infrastructure Deployment Files"
+      RepositoryName: !Sub "${pWorkloadName}-Infrastructure-Deploy"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+  rCodeBuildInfra:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "NO_ARTIFACTS"
+      BadgeEnabled: false
+      Cache: 
+        Type: "NO_CACHE"
+      Description: "Project to carry out Linting Checks using CFN-Lint and Security Checks with CFN-NAG"
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      Environment: 
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: false
+        Type: "LINUX_CONTAINER"
+      LogsConfig: 
+        CloudWatchLogs: 
+          Status: "ENABLED"
+      Name: !Sub "${pWorkloadName}-CloudFormation-Unit-Tests"
+      QueuedTimeoutInMinutes: 480
+      ServiceRole: !GetAtt rIamRoleBuildProject.Arn
+      Source: 
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                ruby: 2.6
+                # name: version
+              commands:
+                - pip3 install awscli --upgrade --quiet
+                - pip3 install cfn-lint --quiet
+                - apt-get install jq git -y -q
+                - gem install cfn-nag
+            build:
+              commands:
+                - cd ./
+                - cfn-lint ${pCoreDeploymentFile}
+                - cfn_nag_scan -i ${pCoreDeploymentFile}
+        GitCloneDepth: 1
+        GitSubmodulesConfig: 
+          FetchSubmodules: false
+        InsecureSsl: false
+        Location: !Sub "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${rCodeCommitInfra.Name}"
+        Type: "CODECOMMIT"
+      SourceVersion: "refs/heads/master"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TimeoutInMinutes: 60
+  rCodeBuildInfraS3Zip:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "NO_ARTIFACTS"
+      BadgeEnabled: false
+      Cache: 
+        Type: "NO_CACHE"
+      Description: "Project to carry out Zipping of Lambda Function Deployment Files and Uploading to Amazon S3"
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      Environment: 
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: false
+        Type: "LINUX_CONTAINER"
+      LogsConfig: 
+        CloudWatchLogs: 
+          Status: "ENABLED"
+      Name: !Sub "${pWorkloadName}-Zip-and-Copy-Lambda-Deployment-to-S3"
+      QueuedTimeoutInMinutes: 480
+      ServiceRole: !GetAtt rIamRoleBuildProject.Arn
+      Source: 
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip3 install awscli --upgrade --quiet
+            build:
+              commands:
+                - chmod +x scripts/copy_lambda_script.sh
+                - ./scripts/copy_lambda_script.sh ${pS3BucketLambdaResources}
+        GitCloneDepth: 1
+        GitSubmodulesConfig: 
+          FetchSubmodules: false
+        InsecureSsl: false
+        Location: !Sub "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${rCodeCommitInfra.Name}"
+        Type: "CODECOMMIT"
+      SourceVersion: "refs/heads/master"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TimeoutInMinutes: 60
+  rCodeBuildInfraUpdateLambdaDev:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "NO_ARTIFACTS"
+      BadgeEnabled: false
+      Cache: 
+        Type: "NO_CACHE"
+      Description: "Project to Update Lambda Functions based on the Latest Version"
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      Environment: 
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: false
+        Type: "LINUX_CONTAINER"
+      LogsConfig: 
+        CloudWatchLogs: 
+          Status: "ENABLED"
+      Name: !Sub "${pWorkloadName}-Update-Lambda-Function-in-Development"
+      QueuedTimeoutInMinutes: 480
+      ServiceRole: !GetAtt rIamRoleBuildProject.Arn
+      Source: 
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip3 install awscli --upgrade --quiet
+            build:
+              commands:
+                - chmod +x scripts/assume_role.sh
+                - chmod +x scripts/update_lambda_function.sh
+                - ./scripts/assume_role.sh arn:aws:iam::${pDevelopmentAccountId}:role/Pipeline-Cross-Account-Access cross-account
+                - ./scripts/update_lambda_function.sh ${pS3BucketLambdaResources}
+        GitCloneDepth: 1
+        GitSubmodulesConfig: 
+          FetchSubmodules: false
+        InsecureSsl: false
+        Location: !Sub "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${rCodeCommitInfra.Name}"
+        Type: "CODECOMMIT"
+      SourceVersion: "refs/heads/master"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TimeoutInMinutes: 60
+  rCodeBuildInfraUpdateLambdaTest:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "NO_ARTIFACTS"
+      BadgeEnabled: false
+      Cache: 
+        Type: "NO_CACHE"
+      Description: "Project to Update Lambda Functions based on the Latest Version"
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      Environment: 
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: false
+        Type: "LINUX_CONTAINER"
+      LogsConfig: 
+        CloudWatchLogs: 
+          Status: "ENABLED"
+      Name: !Sub "${pWorkloadName}-Update-Lambda-Function-in-Test"
+      QueuedTimeoutInMinutes: 480
+      ServiceRole: !GetAtt rIamRoleBuildProject.Arn
+      Source: 
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip3 install awscli --upgrade --quiet
+            build:
+              commands:
+                - chmod +x scripts/assume_role.sh
+                - chmod +x scripts/update_lambda_function.sh
+                - ./scripts/assume_role.sh arn:aws:iam::${pTestAccountId}:role/Pipeline-Cross-Account-Access cross-account
+                - ./scripts/update_lambda_function.sh ${pS3BucketLambdaResources}
+        GitCloneDepth: 1
+        GitSubmodulesConfig: 
+          FetchSubmodules: false
+        InsecureSsl: false
+        Location: !Sub "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${rCodeCommitInfra.Name}"
+        Type: "CODECOMMIT"
+      SourceVersion: "refs/heads/master"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TimeoutInMinutes: 60
+  rCodeBuildInfraUpdateLambdaProd:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "NO_ARTIFACTS"
+      BadgeEnabled: false
+      Cache: 
+        Type: "NO_CACHE"
+      Description: "Project to Update Lambda Functions based on the Latest Version"
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      Environment: 
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: false
+        Type: "LINUX_CONTAINER"
+      LogsConfig: 
+        CloudWatchLogs: 
+          Status: "ENABLED"
+      Name: !Sub "${pWorkloadName}-Update-Lambda-Function-in-Production"
+      QueuedTimeoutInMinutes: 480
+      ServiceRole: !GetAtt rIamRoleBuildProject.Arn
+      Source: 
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip3 install awscli --upgrade --quiet
+            build:
+              commands:
+                - chmod +x scripts/assume_role.sh
+                - chmod +x scripts/update_lambda_function.sh
+                - ./scripts/assume_role.sh arn:aws:iam::${pProductionAccountId}:role/Pipeline-Cross-Account-Access cross-account
+                - ./scripts/update_lambda_function.sh ${pS3BucketLambdaResources}
+        GitCloneDepth: 1
+        GitSubmodulesConfig: 
+          FetchSubmodules: false
+        InsecureSsl: false
+        Location: !Sub "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${rCodeCommitInfra.Name}"
+        Type: "CODECOMMIT"
+      SourceVersion: "refs/heads/master"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TimeoutInMinutes: 60
+  rCodePipelineInfra:
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      ArtifactStore: 
+        EncryptionKey: 
+          Id: !GetAtt rKmsKeyPipeline.Arn
+          Type: "KMS"
+        Location: !Ref rS3PipelineArtifactBucket
+        Type: "S3"
+      Name: !Sub "${pWorkloadName}-Infrastructure-Deployment"
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt rIamRolePipeline.Arn
+      Stages: 
+        - Name: "Source"
+          Actions: 
+            - Name: "Source-CodeCommit"
+              ActionTypeId: 
+                Category: "Source"
+                Owner: "AWS"
+                Provider: "CodeCommit"
+                Version: "1"
+              Configuration: 
+                BranchName: "master"
+                OutputArtifactFormat: "CODE_ZIP"
+                PollForSourceChanges: false
+                RepositoryName: !GetAtt rCodeCommitInfra.Name
+              OutputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 1
+        - Name: "Build"
+          Actions: 
+            - Name: "Zip-and-Copy-Lambda-Deployment-to-S3"
+              ActionTypeId: 
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration: 
+                ProjectName: !Ref rCodeBuildInfraS3Zip
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 1     
+        - Name: "CloudFormation-Unit-Tests"
+          Actions: 
+            - Name: "CFN-Lint-and-CFN-NAG"
+              ActionTypeId: 
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration: 
+                ProjectName: !Ref rCodeBuildInfra
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 1              
+        - Name: "Development-Environment"
+          Actions: 
+            - Name: "Deploy-to-Development"
+              ActionTypeId: 
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "CloudFormation"
+                Version: "1"
+              Configuration: 
+                ActionMode: "CREATE_UPDATE"
+                Capabilities: "CAPABILITY_NAMED_IAM"
+                RoleArn: !Sub "arn:aws:iam::${pDevelopmentAccountId}:role/CloudFormation-Admin"
+                StackName: !Sub "${pWorkloadName}-Infrastructure-Stack"
+                TemplateConfiguration: !Sub "SourceArtifact::${pDevelopmentParameters}"
+                TemplatePath: !Sub "SourceArtifact::${pCoreDeploymentFile}"
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              RoleArn: !Sub "arn:aws:iam::${pDevelopmentAccountId}:role/Pipeline-Cross-Account-Access"
+              Region: !Ref AWS::Region
+              RunOrder: 1
+            - Name: "Update-Lambda-Functions-in-Development"
+              ActionTypeId: 
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration: 
+                ProjectName: !Ref rCodeBuildInfraUpdateLambdaDev
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 2     
+        - Name: "Test-Environment"
+          Actions: 
+            - Name: "Approval-to-Deploy-to-Test"
+              ActionTypeId: 
+                Category: "Approval"
+                Owner: "AWS"
+                Provider: "Manual"
+                Version: "1"
+              Configuration: 
+                NotificationArn: !Ref rSnsTopicTestDeploymentApproval
+              Region: !Ref AWS::Region
+              RunOrder: 1              
+            - Name: "Deploy-to-Test"
+              ActionTypeId: 
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "CloudFormation"
+                Version: "1"
+              Configuration: 
+                ActionMode: "CREATE_UPDATE"
+                Capabilities: "CAPABILITY_NAMED_IAM"
+                RoleArn: !Sub "arn:aws:iam::${pTestAccountId}:role/CloudFormation-Admin"
+                StackName: !Sub "${pWorkloadName}-Infrastructure-Stack"
+                TemplateConfiguration: !Sub "SourceArtifact::${pTestParameters}"
+                TemplatePath: !Sub "SourceArtifact::${pCoreDeploymentFile}"
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              RoleArn: !Sub "arn:aws:iam::${pTestAccountId}:role/Pipeline-Cross-Account-Access"
+              Region: !Ref AWS::Region
+              RunOrder: 2
+            - Name: "Update-Lambda-Functions-in-Test"
+              ActionTypeId: 
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration: 
+                ProjectName: !Ref rCodeBuildInfraUpdateLambdaTest
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 3
+        - Name: "Production-Environment"
+          Actions: 
+            - Name: "Approval-to-Deploy-to-Production"
+              ActionTypeId: 
+                Category: "Approval"
+                Owner: "AWS"
+                Provider: "Manual"
+                Version: "1"
+              Configuration: 
+                NotificationArn: !Ref rSnsTopicProductionDeploymentApproval
+              Region: !Ref AWS::Region
+              RunOrder: 1
+            - Name: "Deploy-to-Production"
+              ActionTypeId: 
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "CloudFormation"
+                Version: "1"
+              Configuration: 
+                ActionMode: "CREATE_UPDATE"
+                Capabilities: "CAPABILITY_NAMED_IAM"
+                RoleArn: !Sub "arn:aws:iam::${pProductionAccountId}:role/CloudFormation-Admin"
+                StackName: !Sub "${pWorkloadName}-Infrastructure-Stack"
+                TemplateConfiguration: !Sub "SourceArtifact::${pProductionParameters}"
+                TemplatePath: !Sub "SourceArtifact::${pCoreDeploymentFile}"
+              InputArtifacts:
+                - Name: "SourceArtifact"
+              RoleArn: !Sub "arn:aws:iam::${pProductionAccountId}:role/Pipeline-Cross-Account-Access"
+              Region: !Ref AWS::Region
+              RunOrder: 2
+            - Name: "Update-Lambda-Functions-in-Production"
+              ActionTypeId: 
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration: 
+                ProjectName: !Ref rCodeBuildInfraUpdateLambdaProd
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 3
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+
+  rCodeCommitEcsBuild:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryDescription: "Repository to be used for Docker Build Files"
+      RepositoryName: !Sub "${pWorkloadName}-ECS-Container-Build"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+  rCodeBuildEcsBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: "CODEPIPELINE"
+      BadgeEnabled: false
+      Cache: 
+        Type: "NO_CACHE"
+      Description: "Project to carry out the Docker Build and to Push to ECR"
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      Environment: 
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: true
+        Type: "LINUX_CONTAINER"
+      LogsConfig: 
+        CloudWatchLogs: 
+          Status: "ENABLED"
+      Name: !Sub "${pWorkloadName}-ECS-Container-Build"
+      QueuedTimeoutInMinutes: 480
+      ServiceRole: !GetAtt rIamRoleBuildProject.Arn
+      Source: 
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR…
+                - aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin ${pEcrRepoUri}
+                - REPOSITORY_URI=${pEcrRepoUri}
+                - IMAGE_TAG=build-$(echo $CODEBUILD_BUILD_ID | awk -F":" '{print $2}')
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image…
+                - docker build -t $REPOSITORY_URI:$IMAGE_TAG -t $REPOSITORY_URI:latest .
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker images…
+                - docker push $REPOSITORY_URI:$IMAGE_TAG 
+                - docker push $REPOSITORY_URI:latest
+                - echo Writing image definitions file…
+                - printf '[{"name":"mqtt-bridge","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+                - cat imagedefinitions.json 
+          artifacts:
+            files: 
+              - imagedefinitions.json
+        Location: !Sub "https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${rCodeCommitEcsBuild.Name}"
+        Type: "CODEPIPELINE"
+      SourceVersion: "refs/heads/master"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+      TimeoutInMinutes: 60
+  rCodePipelineEcsBuild:
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      ArtifactStore: 
+        EncryptionKey: 
+          Id: !GetAtt rKmsKeyPipeline.Arn
+          Type: "KMS"
+        Location: !Ref rS3PipelineArtifactBucket
+        Type: "S3"
+      Name: !Sub "${pWorkloadName}-ECS-Container-Build"
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt rIamRolePipeline.Arn
+      Stages: 
+        - Name: "Source"
+          Actions: 
+            - Name: !GetAtt rCodeCommitEcsBuild.Name
+              ActionTypeId: 
+                Category: "Source"
+                Owner: "AWS"
+                Provider: "CodeCommit"
+                Version: "1"
+              Configuration: 
+                BranchName: "master"
+                OutputArtifactFormat: "CODE_ZIP"
+                PollForSourceChanges: false
+                RepositoryName: !GetAtt rCodeCommitEcsBuild.Name
+              OutputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 1
+        - Name: "Build"
+          Actions: 
+            - Name: "Build-Docker-Image-and-Push-to-ECR"
+              ActionTypeId: 
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration: 
+                ProjectName: !Ref rCodeBuildEcsBuild
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+              OutputArtifacts: 
+                - Name: "BuildArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 1
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+
+  rCodeCommitEcsDeploy:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryDescription: "Repository to be used for Container Deployment Files"
+      RepositoryName: !Sub "${pWorkloadName}-ECS-Container-Deploy"
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+  rCodePipelineEcsDeploy:
+    Type: AWS::CodePipeline::Pipeline
+    Properties: 
+      ArtifactStore: 
+        EncryptionKey: 
+          Id: !GetAtt rKmsKeyPipeline.Arn
+          Type: "KMS"
+        Location: !Ref rS3PipelineArtifactBucket
+        Type: "S3"
+      Name: !Sub "${pWorkloadName}-ECS-Container-Deployment"
+      RestartExecutionOnUpdate: true
+      RoleArn: !GetAtt rIamRolePipeline.Arn
+      Stages: 
+        - Name: "Source"
+          Actions: 
+            - Name: !GetAtt rCodeCommitEcsDeploy.Name
+              ActionTypeId: 
+                Category: "Source"
+                Owner: "AWS"
+                Provider: "CodeCommit"
+                Version: "1"
+              Configuration: 
+                BranchName: "master"
+                OutputArtifactFormat: "CODE_ZIP"
+                PollForSourceChanges: false
+                RepositoryName: !GetAtt rCodeCommitEcsDeploy.Name
+              OutputArtifacts: 
+                - Name: "SourceArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 1
+            - Name: "ECR-Image-Repo"
+              ActionTypeId: 
+                Category: "Source"
+                Owner: "AWS"
+                Provider: "ECR"
+                Version: "1"
+              Configuration: 
+                ImageTag: "latest"
+                RepositoryName: "mqtt-bridge"
+              OutputArtifacts: 
+                - Name: "ImageArtifact"
+              Region: !Ref AWS::Region
+              RunOrder: 1
+        - Name: "Development-Environment"
+          Actions: 
+            - Name: "Blue-Green-Deployment-to-Development"
+              ActionTypeId: 
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "CodeDeployToECS"
+                Version: "1"
+              Configuration: 
+                AppSpecTemplateArtifact: SourceArtifact
+                AppSpecTemplatePath: appspec.yaml
+                ApplicationName: EaaS-MQTT-Bridge
+                DeploymentGroupName: EaaS-MQTT-Bridge-Blue-Green
+                Image1ArtifactName: ImageArtifact
+                Image1ContainerName: IMAGE1_NAME
+                TaskDefinitionTemplateArtifact: SourceArtifact
+                TaskDefinitionTemplatePath: taskdef-dev.json
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+                - Name: "ImageArtifact"
+              RoleArn: !Sub "arn:aws:iam::${pDevelopmentAccountId}:role/Pipeline-Cross-Account-Access"
+              Region: !Ref AWS::Region
+              RunOrder: 1
+        - Name: "Test-Environment"
+          Actions: 
+            - Name: "Approval-to-Deploy-to-Test"
+              ActionTypeId: 
+                Category: "Approval"
+                Owner: "AWS"
+                Provider: "Manual"
+                Version: "1"
+              Configuration: 
+                NotificationArn: !Ref rSnsTopicTestDeploymentApproval
+              Region: !Ref AWS::Region
+              RunOrder: 1  
+            - Name: "Blue-Green-Deployment-to-Test"
+              ActionTypeId: 
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "CodeDeployToECS"
+                Version: "1"
+              Configuration: 
+                AppSpecTemplateArtifact: SourceArtifact
+                AppSpecTemplatePath: appspec.yaml
+                ApplicationName: EaaS-MQTT-Bridge
+                DeploymentGroupName: EaaS-MQTT-Bridge-Blue-Green
+                Image1ArtifactName: ImageArtifact
+                Image1ContainerName: IMAGE1_NAME
+                TaskDefinitionTemplateArtifact: SourceArtifact
+                TaskDefinitionTemplatePath: taskdef-test.json
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+                - Name: "ImageArtifact"
+              RoleArn: !Sub "arn:aws:iam::${pTestAccountId}:role/Pipeline-Cross-Account-Access"
+              Region: !Ref AWS::Region
+              RunOrder: 2
+        - Name: "Production-Environment"
+          Actions: 
+            - Name: "Approval-to-Deploy-to-Production"
+              ActionTypeId: 
+                Category: "Approval"
+                Owner: "AWS"
+                Provider: "Manual"
+                Version: "1"
+              Configuration: 
+                NotificationArn: !Ref rSnsTopicProductionDeploymentApproval
+              Region: !Ref AWS::Region
+              RunOrder: 1  
+            - Name: "Blue-Green-Deployment-to-Production"
+              ActionTypeId: 
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "CodeDeployToECS"
+                Version: "1"
+              Configuration: 
+                AppSpecTemplateArtifact: SourceArtifact
+                AppSpecTemplatePath: appspec.yaml
+                ApplicationName: EaaS-MQTT-Bridge
+                DeploymentGroupName: EaaS-MQTT-Bridge-Blue-Green
+                Image1ArtifactName: ImageArtifact
+                Image1ContainerName: IMAGE1_NAME
+                TaskDefinitionTemplateArtifact: SourceArtifact
+                TaskDefinitionTemplatePath: taskdef-prod.json
+              InputArtifacts: 
+                - Name: "SourceArtifact"
+                - Name: "ImageArtifact"
+              RoleArn: !Sub "arn:aws:iam::${pProductionAccountId}:role/Pipeline-Cross-Account-Access"
+              Region: !Ref AWS::Region
+              RunOrder: 2
+      Tags: 
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName
+
+  # EventBridge Rules
+  rEventBridgeRuleCodeCommitTriggerCodeInfraPipeline:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.codecommit"
+        detail-type:
+          - "CodeCommit Repository State Change"
+        resources:
+          - !GetAtt rCodeCommitInfra.Arn
+        detail:
+          event:
+            - "referenceCreated"
+            - "referenceUpdated"
+          referenceType:
+            - "branch"
+          referenceName:
+            - "master"
+      Name: !Sub "${pWorkloadName}-CodeCommit-Trigger-Infrastructure-Pipeline"
+      Targets:
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipelineInfra}" 
+          RoleArn: !GetAtt rIamRoleEventBridgeTriggerPipeline.Arn
+          Id: "TriggerPipeline"
+  rEventBridgeRuleCodeCommitTriggerEcsBuildPipeline:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.codecommit"
+        detail-type:
+          - "CodeCommit Repository State Change"
+        resources:
+          - !GetAtt rCodeCommitEcsBuild.Arn
+        detail:
+          event:
+            - "referenceCreated"
+            - "referenceUpdated"
+          referenceType:
+            - "branch"
+          referenceName:
+            - "master"
+      Name: !Sub "${pWorkloadName}-CodeCommit-Trigger-Container-Image-Creation-Pipeline"
+      Targets:
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipelineEcsBuild}" 
+          RoleArn: !GetAtt rIamRoleEventBridgeTriggerPipeline.Arn
+          Id: "TriggerPipeline"
+  rEventBridgeRuleCodeCommitTriggerEcsDeployPipeline:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.codecommit"
+        detail-type:
+          - "CodeCommit Repository State Change"
+        resources:
+          - !GetAtt rCodeCommitEcsDeploy.Arn
+        detail:
+          event:
+            - "referenceCreated"
+            - "referenceUpdated"
+          referenceType:
+            - "branch"
+          referenceName:
+            - "master"
+      Name: !Sub "${pWorkloadName}-CodeCommit-Trigger-Container-Deployment-Pipeline"
+      Targets:
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipelineEcsDeploy}" 
+          RoleArn: !GetAtt rIamRoleEventBridgeTriggerPipeline.Arn
+          Id: "TriggerPipeline"
+  rEventBridgeRuleEcrTriggerEcsDeployPipeline:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - "aws.ecr"
+        detail-type:
+          - "ECR Image Action"
+        detail:
+          action-type:
+            - "PUSH"
+          image-tag:
+            - "latest"
+          repository-name:
+            - "mqtt-bridge"
+          result:
+            - "SUCCESS"
+      Name: !Sub "${pWorkloadName}-ECR-Trigger-Container-Deployment-Pipeline"
+      Targets:
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${rCodePipelineEcsDeploy}" 
+          RoleArn: !GetAtt rIamRoleEventBridgeTriggerPipeline.Arn
+          Id: "TriggerPipeline"

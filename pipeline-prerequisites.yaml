@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Pre-Requisites Deployment Required for CI/CD Pipeline"
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: 
+          default: Account Configuration
+        Parameters:
+          - pDevelopmentAccountId
+          - pTestAccountId
+          - pProductionAccountId
+      - Label: 
+          default: ECR Repo Configuration
+        Parameters:
+          - pEcrRepoName
+      - Label: 
+          default: Tagging Configuration
+        Parameters:
+          - pEnvironmentName
+          - pWorkloadName
+Parameters:
+  pDevelopmentAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be used as the Development Account."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+  pTestAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be used as the Test Account."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+  pProductionAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be used as the Production Account."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+  pEcrRepoName:
+    Type: String
+    Description: "Name of the ECR Repo"  
+  pEnvironmentName:
+    Type: String
+    Description: "Select the Name of the Environment"
+    AllowedValues:
+      - Production
+      - Test
+      - Development
+  pWorkloadName:
+    Type: String
+    Description: "Name of the Workload"    
+Resources:
+  # S3 Bucket
+  rS3LambdaBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Sub "lambda-resources-${AWS::Region}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName          
+  rS3LambdaBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref rS3LambdaBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:          
+          - Action: "s3:*"
+            Effect: "Deny"
+            Principal: "*"
+            Resource:
+              - !Sub "arn:aws:s3:::${rS3LambdaBucket}"
+              - !Sub "arn:aws:s3:::${rS3LambdaBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Effect: "Allow"
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${pDevelopmentAccountId}:root"
+                - !Sub "arn:aws:iam::${pTestAccountId}:root"
+                - !Sub "arn:aws:iam::${pProductionAccountId}:root"
+            Action: 
+              - "s3:Get*"
+              - "s3:Put*"
+            Resource: 
+              - !Sub "arn:aws:s3:::${rS3LambdaBucket}/*"
+          - Effect: "Allow"
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${pDevelopmentAccountId}:root"
+                - !Sub "arn:aws:iam::${pTestAccountId}:root"
+                - !Sub "arn:aws:iam::${pProductionAccountId}:root"
+            Action: 
+              - "s3:ListBucket"
+            Resource: 
+              - !Sub "arn:aws:s3:::${rS3LambdaBucket}"
+
+  # ECR Repository
+  rEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties: 
+      ImageScanningConfiguration: 
+        ScanOnPush: true
+      RepositoryName: !Ref pEcrRepoName
+      RepositoryPolicyText: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              AWS: 
+                - !Sub "arn:aws:iam::${pDevelopmentAccountId}:role/ECS-Task-Execution"
+                - !Sub "arn:aws:iam::${pTestAccountId}:role/ECS-Task-Execution"
+                - !Sub "arn:aws:iam::${pProductionAccountId}:role/ECS-Task-Execution"
+            Action:
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+      Tags:
+        - Key: Environment
+          Value: !Ref pEnvironmentName
+        - Key: Workload
+          Value: !Ref pWorkloadName

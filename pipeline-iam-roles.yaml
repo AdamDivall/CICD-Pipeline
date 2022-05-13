@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Account IAM Roles Deployment Needed for CI/CD Pipeline for Infrastructure Deployment"
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: 
+          default: Account Configuration
+        Parameters:
+        - pToolingAccountId
+Parameters:
+  pToolingAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be used as the Tooling Account."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+Resources:
+  # IAM Roles
+  rIamRoleCloudFormationAdmin:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "cloudformation.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        - !Ref rIamPolicyCrossAccountS3
+      RoleName: "CloudFormation-Admin"
+  rIamRolePipelineCrossAccountAccessRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              AWS: 
+                - !Sub "arn:aws:iam::${pToolingAccountId}:root"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - !Ref rIamPolicyPipelineCrossAccountAccessRole
+        - "arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS"
+      RoleName: "Pipeline-Cross-Account-Access"
+  rIamRoleEcsTaskExecution:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "ecs-tasks.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        - !Ref rIamPolicyEcsTaskExecution
+      RoleName: "ECS-Task-Execution"
+
+  # IAM Policies
+  rIamPolicyPipelineCrossAccountAccessRole:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "Pipeline-Cross-Account-Access"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "kms:DescribeKey"
+              - "kms:GenerateDataKey*"
+              - "kms:Encrypt"
+              - "kms:ReEncrypt*"
+              - "kms:Decrypt"
+            Resource: 
+              - !Sub "arn:aws:kms:eu-west-2:${pToolingAccountId}:key/*"
+          - Effect: "Allow"
+            Action: 
+              - "cloudformation:*"
+              - "codedeploy:*"
+              - "ecs:*"
+              - "iam:PassRole"
+              - "lambda:UpdateFunctionCode"
+            Resource:
+              - "*"
+          - Effect: "Allow"
+            Action:
+              - "s3:Get*"
+              - "s3:Put*"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::codepipeline-${AWS::Region}-${pToolingAccountId}/*"
+              - !Sub "arn:aws:s3:::codepipeline-${AWS::Region}-${pToolingAccountId}"
+  rIamPolicyEcsTaskExecution:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "ECS-Task-Execution"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action: 
+              - "ecr:*"
+            Resource:
+              - !Sub "arn:aws:ecr:${AWS::Region}:${pToolingAccountId}:repository/*"
+          - Effect: "Allow"
+            Action: 
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - "*"
+  rIamPolicyCrossAccountS3:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: "Cross-Account-S3-Access"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:Get*"
+              - "s3:Put*"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::lambda-resources-${AWS::Region}-${pToolingAccountId}/*"
+              - !Sub "arn:aws:s3:::lambda-resources-${AWS::Region}-${pToolingAccountId}"
