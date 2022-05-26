@@ -1,4 +1,4 @@
-# CICD Pipeline
+# CI/CD Pipeline
 
 ## Background
 The files in this repository came about based on a requirement I had to build a Pipeline for Route-to-Live for Infrastructure Deployment. The Infrastructure itself was predominantly Lambda based but also had Fargate for a particular requirement.
